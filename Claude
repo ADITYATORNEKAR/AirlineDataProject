@@ -1,1 +1,371 @@
+python# ─────────────────────────────────────────────
+# BLOCK 2 (REVISED): Data Loading & Validation
+# Supports THREE sources:
+#   A) Parquet file
+#   B) CSV file  
+#   C) Redshift (via psycopg2 or SQLAlchemy)
+#       — pass your query directly
+# ─────────────────────────────────────────────
 
+import pandas as pd
+import numpy as np
+import logging
+import os
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# ══════════════════════════════════════════════════════════
+# REDSHIFT CONNECTION CONFIG
+# Reads from environment variables — never hardcode creds
+# Set these in SageMaker env vars, .env file, or AWS Secrets
+# ══════════════════════════════════════════════════════════
+
+REDSHIFT_CONFIG = {
+    'host'    : os.environ.get('REDSHIFT_HOST'),        # e.g. my-cluster.abc123.us-east-1.redshift.amazonaws.com
+    'port'    : int(os.environ.get('REDSHIFT_PORT', 5439)),
+    'dbname'  : os.environ.get('REDSHIFT_DBNAME'),      # e.g. analytics
+    'user'    : os.environ.get('REDSHIFT_USER'),
+    'password': os.environ.get('REDSHIFT_PASSWORD'),
+    'connect_timeout': 30,
+}
+
+# ══════════════════════════════════════════════════════════
+# YOUR REDSHIFT QUERIES — drop your queries in here
+# ══════════════════════════════════════════════════════════
+
+REDSHIFT_QUERIES = {
+
+    # ── Primary MMA daily balance query ───────────────────
+    # Must return: date, account_id, customer_id, product_type, balance
+    'mma_daily': """
+        SELECT
+            cast(balance_date AS date)   AS date,
+            account_id,
+            customer_id,
+            product_type,
+            end_of_day_balance           AS balance
+        FROM analytics.daily_account_balances
+        WHERE product_type = 'MMA'
+          AND balance_date >= dateadd(year, -2, current_date)
+          AND balance_date <  current_date
+        ORDER BY account_id, balance_date
+    """,
+
+    # ── All products query (needed for cross-product features) ─
+    # Same schema, no product_type filter
+    'all_products_daily': """
+        SELECT
+            cast(balance_date AS date)   AS date,
+            account_id,
+            customer_id,
+            product_type,
+            end_of_day_balance           AS balance
+        FROM analytics.daily_account_balances
+        WHERE balance_date >= dateadd(year, -2, current_date)
+          AND balance_date <  current_date
+          AND product_type IN ('CHK', 'MMA', 'SAV', 'CD')
+        ORDER BY account_id, balance_date
+    """,
+
+    # ── Account metadata query (optional enrichment) ──────
+    'account_metadata': """
+        SELECT
+            account_id,
+            customer_id,
+            customer_segment,
+            account_open_date,
+            account_status,
+            relationship_manager_id
+        FROM analytics.dim_accounts
+        WHERE product_type = 'MMA'
+          AND account_status = 'ACTIVE'
+    """,
+}
+
+
+# ══════════════════════════════════════════════════════════
+# CONNECTION HELPERS
+# ══════════════════════════════════════════════════════════
+
+def _get_psycopg2_connection():
+    """
+    Direct psycopg2 connection to Redshift.
+    Use when you don't need SQLAlchemy (faster for read-only pulls).
+    """
+    try:
+        import psycopg2
+    except ImportError:
+        raise ImportError("Run: pip install psycopg2-binary")
+
+    missing = [k for k, v in REDSHIFT_CONFIG.items() if v is None and k != 'connect_timeout']
+    if missing:
+        raise EnvironmentError(
+            f"Missing Redshift env vars: {missing}\n"
+            f"Set REDSHIFT_HOST, REDSHIFT_PORT, REDSHIFT_DBNAME, "
+            f"REDSHIFT_USER, REDSHIFT_PASSWORD"
+        )
+
+    conn = psycopg2.connect(**REDSHIFT_CONFIG)
+    logger.info(f"Redshift connected: {REDSHIFT_CONFIG['host']} / {REDSHIFT_CONFIG['dbname']}")
+    return conn
+
+
+def _get_sqlalchemy_engine():
+    """
+    SQLAlchemy engine — use when you need pd.read_sql() 
+    or connection pooling for repeated queries.
+    """
+    try:
+        from sqlalchemy import create_engine
+    except ImportError:
+        raise ImportError("Run: pip install sqlalchemy sqlalchemy-redshift psycopg2-binary")
+
+    cfg = REDSHIFT_CONFIG
+    url = (
+        f"redshift+psycopg2://{cfg['user']}:{cfg['password']}"
+        f"@{cfg['host']}:{cfg['port']}/{cfg['dbname']}"
+    )
+    engine = create_engine(url, connect_args={'connect_timeout': cfg['connect_timeout']})
+    logger.info(f"SQLAlchemy engine created for {cfg['host']}")
+    return engine
+
+
+# ══════════════════════════════════════════════════════════
+# REDSHIFT LOADER
+# ══════════════════════════════════════════════════════════
+
+def load_from_redshift(
+    query      : str,
+    query_name : str = 'query',
+    chunksize  : int = None,     # set ~500_000 for very large pulls
+    use_engine : bool = False,   # True = SQLAlchemy, False = psycopg2
+) -> pd.DataFrame:
+    """
+    Execute a Redshift query and return a DataFrame.
+
+    Args:
+        query      : Full SQL string (use REDSHIFT_QUERIES dict or pass custom)
+        query_name : Label for logging
+        chunksize  : If set, reads in chunks and concatenates (memory-safe for large pulls)
+        use_engine : Use SQLAlchemy engine instead of raw psycopg2
+
+    Returns:
+        pd.DataFrame with raw query results
+    """
+    logger.info(f"Pulling from Redshift: [{query_name}]")
+    logger.info(f"Query preview: {query.strip()[:120]}...")
+
+    try:
+        if use_engine or chunksize:
+            # SQLAlchemy path — better for chunked reads
+            engine = _get_sqlalchemy_engine()
+            if chunksize:
+                chunks = pd.read_sql(query, engine, chunksize=chunksize)
+                df = pd.concat(chunks, ignore_index=True)
+                logger.info(f"  Chunked read complete: {len(df):,} rows")
+            else:
+                df = pd.read_sql(query, engine)
+
+        else:
+            # psycopg2 path — lighter weight for standard pulls
+            conn = _get_psycopg2_connection()
+            try:
+                df = pd.read_sql_query(query, conn)
+            finally:
+                conn.close()
+                logger.info("  Redshift connection closed")
+
+        logger.info(f"  [{query_name}] → {len(df):,} rows, {df.shape[1]} columns")
+        return df
+
+    except Exception as e:
+        logger.error(f"Redshift pull failed for [{query_name}]: {e}")
+        raise
+
+
+def load_from_redshift_custom(
+    custom_query : str,
+    chunksize    : int = None,
+) -> pd.DataFrame:
+    """
+    Convenience wrapper — pass any ad-hoc query directly.
+    Your queries are ready? Drop them straight in here.
+
+    Usage:
+        my_query = '''
+            SELECT date, account_id, customer_id, product_type, balance
+            FROM your_schema.your_table
+            WHERE ...
+        '''
+        df = load_from_redshift_custom(my_query)
+    """
+    return load_from_redshift(
+        query=custom_query,
+        query_name='custom_query',
+        chunksize=chunksize
+    )
+
+
+# ══════════════════════════════════════════════════════════
+# VALIDATION (shared across all sources)
+# ══════════════════════════════════════════════════════════
+
+def validate_and_clean(df: pd.DataFrame, product_filter: str = 'MMA') -> pd.DataFrame:
+    """
+    Schema validation, type coercion, gap-filling, dedup.
+    Called identically regardless of whether data came from
+    parquet, CSV, or Redshift.
+    """
+    required_cols = ['date', 'account_id', 'customer_id', 'product_type', 'balance']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Missing columns: {missing}\n"
+            f"Got: {list(df.columns)}\n"
+            f"Rename your query columns to match: {required_cols}"
+        )
+
+    # ── Type coercion ──────────────────────────────────────────────────────────
+    df['date']        = pd.to_datetime(df['date'])
+    df['balance']     = pd.to_numeric(df['balance'], errors='coerce').astype(float)
+    df['account_id']  = df['account_id'].astype(str).str.strip()
+    df['customer_id'] = df['customer_id'].astype(str).str.strip()
+
+    # ── Filter to target product ───────────────────────────────────────────────
+    before = len(df)
+    df = df[df['product_type'] == product_filter].copy()
+    logger.info(
+        f"Product filter '{product_filter}': {before:,} → {len(df):,} rows | "
+        f"{df['account_id'].nunique():,} accounts"
+    )
+    logger.info(f"Date range: {df['date'].min().date()} → {df['date'].max().date()}")
+
+    # ── Deduplicate ────────────────────────────────────────────────────────────
+    dupes = df.duplicated(subset=['date', 'account_id']).sum()
+    if dupes > 0:
+        logger.warning(f"{dupes:,} duplicate (date, account_id) rows — keeping last")
+        df = df.drop_duplicates(subset=['date', 'account_id'], keep='last')
+
+    # ── Fill missing dates (ensure contiguous daily index per account) ─────────
+    df = df.set_index(['account_id', 'date'])
+    full_idx = pd.MultiIndex.from_product(
+        [
+            df.index.get_level_values(0).unique(),
+            pd.date_range(df.index.get_level_values(1).min(),
+                          df.index.get_level_values(1).max(), freq='D')
+        ],
+        names=['account_id', 'date']
+    )
+    df = df.reindex(full_idx)
+
+    # Forward-fill gaps (carry last known balance forward)
+    df['balance'] = (
+        df['balance']
+        .groupby(level=0)
+        .transform(lambda s: s.ffill().bfill())
+    )
+    # Propagate customer_id and product_type through filled rows
+    for col in ['customer_id', 'product_type']:
+        if col in df.columns:
+            df[col] = df[col].groupby(level=0).transform(lambda s: s.ffill().bfill())
+
+    df = df.reset_index()
+
+    # ── Negative balance guard ─────────────────────────────────────────────────
+    neg = (df['balance'] < 0).sum()
+    if neg > 0:
+        logger.warning(f"{neg:,} negative balance rows — clipping to 0")
+        df['balance'] = df['balance'].clip(lower=0)
+
+    # ── Balance NaN guard (accounts with no valid history) ────────────────────
+    nan_rows = df['balance'].isna().sum()
+    if nan_rows > 0:
+        logger.warning(f"{nan_rows:,} rows with NaN balance after fill — dropping")
+        df = df.dropna(subset=['balance'])
+
+    logger.info(f"Final shape after cleaning: {df.shape}")
+    return df.sort_values(['account_id', 'date']).reset_index(drop=True)
+
+
+def account_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-account metadata from history — used as static features downstream."""
+    grp = df.groupby('account_id')['balance']
+    summary = pd.DataFrame({
+        'avg_balance'         : grp.mean(),
+        'std_balance'         : grp.std(),
+        'min_balance'         : grp.min(),
+        'max_balance'         : grp.max(),
+        'cv_balance'          : grp.std() / (grp.mean() + 1),
+        'account_tenure_days' : df.groupby('account_id')['date'].count(),
+        'customer_id'         : df.groupby('account_id')['customer_id'].first(),
+    }).reset_index()
+    return summary
+
+
+# ══════════════════════════════════════════════════════════
+# UNIFIED LOADER — single entry point for all sources
+# ══════════════════════════════════════════════════════════
+
+def load_and_validate(
+    source         : str,                # 'parquet' | 'csv' | 'redshift'
+    filepath       : str  = None,        # for parquet / csv
+    query          : str  = None,        # for redshift — your SQL string
+    query_name     : str  = 'mma_daily', # key into REDSHIFT_QUERIES if query=None
+    product_filter : str  = 'MMA',
+    chunksize      : int  = None,        # redshift only — chunked pull
+) -> pd.DataFrame:
+    """
+    Unified loader. Same validation regardless of source.
+
+    Examples
+    --------
+    # From parquet:
+    df = load_and_validate(source='parquet', filepath='data/mma.parquet')
+
+    # From CSV:
+    df = load_and_validate(source='csv', filepath='data/mma.csv')
+
+    # From Redshift using pre-built query:
+    df = load_and_validate(source='redshift', query_name='mma_daily')
+
+    # From Redshift using your own query:
+    df = load_and_validate(
+        source='redshift',
+        query='''
+            SELECT date, account_id, customer_id, product_type, balance
+            FROM your_schema.your_table
+            WHERE ...
+        '''
+    )
+    """
+    source = source.lower().strip()
+
+    # ── Load raw data ──────────────────────────────────────────────────────────
+    if source == 'parquet':
+        if not filepath:
+            raise ValueError("filepath required for source='parquet'")
+        logger.info(f"Loading from parquet: {filepath}")
+        df = pd.read_parquet(filepath)
+
+    elif source == 'csv':
+        if not filepath:
+            raise ValueError("filepath required for source='csv'")
+        logger.info(f"Loading from CSV: {filepath}")
+        df = pd.read_csv(filepath, parse_dates=['date'], low_memory=False)
+
+    elif source == 'redshift':
+        # Use passed query, or look up from REDSHIFT_QUERIES dict
+        sql = query or REDSHIFT_QUERIES.get(query_name)
+        if not sql:
+            raise ValueError(
+                f"No query found. Pass query='SELECT ...' or "
+                f"set query_name to one of: {list(REDSHIFT_QUERIES.keys())}"
+            )
+        df = load_from_redshift(sql, query_name=query_name, chunksize=chunksize)
+
+    else:
+        raise ValueError(f"Unknown source='{source}'. Choose: 'parquet' | 'csv' | 'redshift'")
+
+    # ── Validate & clean (identical path for all sources) ─────────────────────
+    return validate_and_clean(df, product_filter=product_filter)
